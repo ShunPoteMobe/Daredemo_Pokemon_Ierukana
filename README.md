@@ -1,0 +1,2 @@
+# Daredemo_Pokemon_Ierukana
+誰でもポケモン言えるかな作成ツール
