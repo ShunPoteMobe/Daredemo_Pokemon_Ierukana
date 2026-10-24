@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 
 LONG_VOWEL = "ー"
 SOKUON = "っ"
@@ -24,22 +25,29 @@ _VOWEL_GROUPS = {
 }
 _VOWEL_OF_KANA = {kana: vowel for vowel, chars in _VOWEL_GROUPS.items() for kana in chars}
 
-# 濁音・半濁音は清音と同じ行として扱う（仕様で合意済み）。ゔ は音が近い は行 に含める
-_ROW_GROUPS = {
-    "a": "あいうえおぁぃぅぇぉ",
-    "k": "かきくけこがぎぐげご",
-    "s": "さしすせそざじずぜぞ",
-    "t": "たちつてとだぢづでど",
+# 子音（清濁を区別する）。"" は母音だけの音。ゔ は音が近い ば と同じに扱う
+CONSONANT_SOKUON = "Q"
+CONSONANT_HATSUON = "N"
+_CONSONANT_GROUPS = {
+    "": "あいうえおぁぃぅぇぉ",
+    "k": "かきくけこ",
+    "g": "がぎぐげご",
+    "s": "さしすせそ",
+    "z": "ざじずぜぞ",
+    "t": "たちつてと",
+    "d": "だぢづでど",
     "n": "なにぬねの",
-    "h": "はひふへほばびぶべぼぱぴぷぺぽゔ",
+    "h": "はひふへほ",
+    "b": "ばびぶべぼゔ",
+    "p": "ぱぴぷぺぽ",
     "m": "まみむめも",
     "y": "やゆよゃゅょ",
     "r": "らりるれろ",
     "w": "わをゐゑゎ",
 }
-_ROW_OF_KANA = {kana: row for row, chars in _ROW_GROUPS.items() for kana in chars}
+_CONSONANT_OF_KANA = {kana: consonant for consonant, chars in _CONSONANT_GROUPS.items() for kana in chars}
 
-_HIRAGANA_CHARS = set(_VOWEL_OF_KANA) | set(_ROW_OF_KANA) | {LONG_VOWEL, SOKUON, HATSUON}
+_HIRAGANA_CHARS = set(_VOWEL_OF_KANA) | set(_CONSONANT_OF_KANA) | {LONG_VOWEL, SOKUON, HATSUON}
 
 
 def katakana_to_hiragana(text: str) -> str:
@@ -81,16 +89,27 @@ def split_morae(reading: str) -> list[str]:
 
 @dataclass(frozen=True)
 class Mora:
-    """1音分の情報。vowel/row は該当しない音（っ・ん 等）では None。"""
+    """1音分の情報。
+
+    vowel は っ・ん では None。consonant は清濁を区別した子音で、母音だけの音（ー を含む）は ""、
+    っ は CONSONANT_SOKUON、ん は CONSONANT_HATSUON。
+    """
 
     text: str
     vowel: str | None
-    row: str | None
+    consonant: str
+    # フレーズ側でユーザーが「省略しない」に設定した ー・っ
+    fixed: bool = False
+
+    @property
+    def attaches_to_previous(self) -> bool:
+        """直前の音に付く音（ー・っ）か。区切りの先頭には置かない。"""
+        return self.text in (LONG_VOWEL, SOKUON)
 
     @property
     def is_optional_in_phrase(self) -> bool:
         """フレーズ側で「あってもなくてもよい」音か。ん は1音として必ず数える（仕様で合意済み）。"""
-        return self.text in (LONG_VOWEL, SOKUON)
+        return self.attaches_to_previous and not self.fixed
 
     @property
     def is_extendable_tail(self) -> bool:
@@ -99,18 +118,43 @@ class Mora:
 
 
 def to_morae(reading: str) -> list[Mora]:
-    """読みを Mora のリストに変換する。ー の母音は直前の音の母音とする。"""
+    """読みを Mora のリストに変換する。
+
+    ー は直前の音の母音だけの音とする（くー の ー は「う」と同じ音）。
+    """
     result: list[Mora] = []
     for text in split_morae(reading):
         if text == LONG_VOWEL:
             vowel = result[-1].vowel if result else None
-            row = None
-        elif text in (SOKUON, HATSUON):
-            vowel = None
-            row = None
+            consonant = ""
+        elif text == SOKUON:
+            vowel, consonant = None, CONSONANT_SOKUON
+        elif text == HATSUON:
+            vowel, consonant = None, CONSONANT_HATSUON
         else:
-            # 拗音は最後の小書き文字で母音、最初の文字で行が決まる（しょ → o, さ行）
+            # 拗音は最後の小書き文字で母音、最初の文字で子音が決まる（しょ → o, s）
             vowel = _VOWEL_OF_KANA.get(text[-1])
-            row = _ROW_OF_KANA.get(text[0])
-        result.append(Mora(text, vowel, row))
+            consonant = _CONSONANT_OF_KANA[text[0]]
+        result.append(Mora(text, vowel, consonant))
+    return result
+
+
+def is_fixable(ch: str) -> bool:
+    """「省略しない」に設定できる文字（ー・っ）か。"""
+    return ch in (LONG_VOWEL, SOKUON)
+
+
+def to_phrase_morae(text: str, fixed_positions: Iterable[int] = ()) -> list[Mora]:
+    """フレーズを Mora のリストに変換し、fixed_positions（0始まりの文字の位置）の ー・っ を「省略しない」にする。"""
+    fixed = set(fixed_positions)
+    morae = to_morae(text)
+    if not fixed:
+        return morae
+    result = []
+    position = 0
+    for mora in morae:
+        if mora.attaches_to_previous and position in fixed:
+            mora = replace(mora, fixed=True)
+        result.append(mora)
+        position += len(mora.text)
     return result

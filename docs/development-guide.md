@@ -30,9 +30,13 @@ python -m venv .venv
 add あらたな ひかりを たどりつくばしょ
 conv all          # 全フレーズを変換
 show 3            # フレーズ3の候補を表示
-combo 3 2         # フレーズ3の組合わせ候補2を選択
-pick 3 2 1        # フレーズ3の枠2の候補1を選択
-manual 3 1 ピカチュウ  # フレーズ3の枠1にポケモンを手入力
+sel 3 1 1 1       # フレーズ3の 組合わせ1・枠1・候補1 を選択情報に追加
+sel 3 2 2 3       # 続けて 組合わせ2・枠2・候補3 を追加（組合わせや枠をまたいでよい）
+swap 3 1 2 1 2    # 選択情報の1番目を 組合わせ2・枠1・候補2 と入れ替え
+manual 3 ピカチュウ    # 選択情報の末尾に手入力で追加（manual 3 ピカチュウ 2 なら2番目を入れ替え）
+unsel 3 2         # 選択情報の2番目を削除（unsel 3 all で全消去）
+edit 2 ひかりをー  # フレーズ2を変更（候補・選択情報・省略しない設定はリセット）
+fix 1 4           # フレーズ1の4文字目（ー・っ）を「省略しない」に（unfix 1 4 / unfix 1 all で解除）
 mode              # 重複OK / 重複NG を切り替え（反映は conv all で）
 merge 1 2         # 連続したフレーズ1と2を合体
 split 1 4         # フレーズ1を先頭から4文字目の後ろで2つに分割
@@ -51,3 +55,15 @@ load data\songs\song.json
 ```powershell
 .venv\Scripts\python.exe -m pytest
 ```
+
+## 一致度の調整
+`data/tuning_examples.json` に正解例（フレーズ → ほしいポケモンの並び）を書き、評価スクリプトで結果を確認する。
+
+```powershell
+.venv\Scripts\python.exe scripts\evaluate_scoring.py
+.venv\Scripts\python.exe scripts\evaluate_scoring.py --vowel-weight 3 --consonant-weight 1 --penalty 1.5 --dropped 2 `
+    --weak-threshold 0.65 --weak-penalty 1 --long-vowel-penalty 0.5
+```
+
+例ごとに上位の組合わせ候補と、正解の並びが「出た / 候補内 / 出ない」のどれだったかを表示する。
+出なかった並びは、その並びで区切ったときの一致度も表示する。よい値が見つかったら `scoring.ScoringParams` の既定値に反映する。

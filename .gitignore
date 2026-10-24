@@ -249,3 +249,5 @@ claude_prompt.txt
 # PokeAPI raw data (large; regenerate data/pokemon.json from it locally)
 data/raw/
 claude_prompt.md
+# Saved songs (contain lyrics; keep local only)
+data/songs/

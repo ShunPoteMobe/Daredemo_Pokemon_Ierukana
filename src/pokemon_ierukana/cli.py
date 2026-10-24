@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .kana import is_fixable
 from .repository import PokemonIndex, load_pokemon
-from .scoring import SCORE_LABELS, decode_score
 from .segmenter import Combination, Converter
 from .song import Phrase, Song
 from .song_json import load_song, save_song
@@ -18,15 +18,19 @@ DEFAULT_SONG_DIR = Path(__file__).resolve().parents[2] / "data" / "songs"
 HELP = """\
 コマンド一覧（N はフレーズの番号、gK はグループ。<対象> には N と gK のどちらも使えます）
   add [フレーズ ...]           フレーズを追加（省略すると空行まで1行ずつ入力）
+  edit <N> <フレーズ>                     フレーズを変更（候補・選択情報・省略しない設定はリセット）
   del <N>                      フレーズを削除
   list                         フレーズと選択中のポケモンを一覧表示
   show <N>                     フレーズの候補を詳しく表示
   conv <対象> | conv all       変換（グループはメンバーを歌詞の順に。ロック中は飛ばす）
-  combo <N> <C>                組合わせ候補 C を選択
-  pick <N> <枠> <候補>         選択中の組合わせで、枠の個別候補を選択（手入力は取り消し）
-  manual <N> <枠> <ポケモン>   枠にポケモンを手入力（名前または読み）
+  sel <N> <組合わせ> <枠> <候補>          候補を選択情報の末尾に追加
+  swap <N> <位置> <組合わせ> <枠> <候補>  選択情報の<位置>を候補と入れ替え
+  manual <N> <ポケモン> [位置]            手入力（名前または読み。位置を省略すると末尾に追加）
+  unsel <N> <位置> | unsel <N> all        選択情報から削除／全消去
   merge <N> <M> ...            連続したフレーズを合体
   split <N> <位置>             先頭から<位置>文字目の後ろで2つに分割
+  fix <N> <位置> [<位置> ...]             ー・っ を「省略しない」にする（位置は先頭から何文字目か）
+  unfix <N> <位置> [...] | unfix <N> all  「省略しない」を解除
   channel <対象> <C>           重複チャンネルを設定（同じチャンネルどうしで重複を避ける）
   lock <対象> / unlock <対象>  ロック／解除
   group <N> <M> ... [名前]     グループを作成
@@ -101,6 +105,35 @@ class _App:
             except ValueError as e:
                 print(f"  エラー: {e}")
 
+    def cmd_edit(self, args: list[str]) -> None:
+        if len(args) != 2:
+            raise ValueError("edit <N> <フレーズ> の形で指定してください")
+        phrase = self._phrase(args[0])
+        before = phrase.text
+        self.song.edit_phrase(phrase.id, args[1])
+        print(f"「{before}」を「{phrase.text}」に変更しました（候補・選択情報・省略しない設定はリセット）")
+
+    def cmd_fix(self, args: list[str]) -> None:
+        phrase, positions = self._phrase_and_positions(args, "fix")
+        self.song.set_fixed(phrase.id, positions, True)
+        print(f"  {_fixable_line(phrase)}")
+        print("  反映するには変換し直してください")
+
+    def cmd_unfix(self, args: list[str]) -> None:
+        if len(args) == 2 and args[1] == "all":
+            phrase = self._phrase(args[0])
+            positions = sorted(phrase.fixed_positions)
+        else:
+            phrase, positions = self._phrase_and_positions(args, "unfix")
+        self.song.set_fixed(phrase.id, positions, False)
+        print(f"  {_fixable_line(phrase)}")
+        print("  反映するには変換し直してください")
+
+    def _phrase_and_positions(self, args: list[str], command: str) -> tuple[Phrase, list[int]]:
+        if len(args) < 2 or not all(a.isdigit() for a in args[1:]):
+            raise ValueError(f"{command} <N> <位置> [<位置> ...] の形で指定してください")
+        return self._phrase(args[0]), [int(a) - 1 for a in args[1:]]
+
     def cmd_del(self, args: list[str]) -> None:
         phrase = self._phrase(_single(args))
         self.song.remove_phrase(phrase.id)
@@ -148,22 +181,38 @@ class _App:
         else:
             self._print_detail(self.song.convert_phrase(self._phrase(target).id, self.converter))
 
-    def cmd_combo(self, args: list[str]) -> None:
-        phrase, (combination_index,) = self._phrase_and_numbers(args, 1)
-        self.song.select_combination(phrase.id, combination_index)
-        self._print_detail(phrase)
+    # ---- 選択情報 ----
 
-    def cmd_pick(self, args: list[str]) -> None:
-        phrase, (slot_index, candidate_index) = self._phrase_and_numbers(args, 2)
-        self.song.select_candidate(phrase.id, slot_index, candidate_index)
-        self._print_detail(phrase)
+    def cmd_sel(self, args: list[str]) -> None:
+        phrase, numbers = self._phrase_and_numbers(args, 3)
+        self.song.add_selection(phrase.id, self.song.candidate(phrase.id, *numbers))
+        self._print_selection(phrase)
+
+    def cmd_swap(self, args: list[str]) -> None:
+        phrase, (position, *numbers) = self._phrase_and_numbers(args, 4)
+        self.song.replace_selection(phrase.id, position, self.song.candidate(phrase.id, *numbers))
+        self._print_selection(phrase)
 
     def cmd_manual(self, args: list[str]) -> None:
-        if len(args) != 3 or not args[1].isdigit():
-            raise ValueError("manual <N> <枠> <ポケモン> の形で指定してください")
+        if len(args) not in (2, 3) or (len(args) == 3 and not args[2].isdigit()):
+            raise ValueError("manual <N> <ポケモン> [位置] の形で指定してください")
         phrase = self._phrase(args[0])
-        self.song.set_manual(phrase.id, int(args[1]) - 1, self.index.find(args[2]))
-        self._print_detail(phrase)
+        pokemon = self.index.find(args[1])
+        if len(args) == 3:
+            self.song.replace_selection(phrase.id, int(args[2]) - 1, pokemon)
+        else:
+            self.song.add_selection(phrase.id, pokemon)
+        self._print_selection(phrase)
+
+    def cmd_unsel(self, args: list[str]) -> None:
+        if len(args) != 2 or not (args[1] == "all" or args[1].isdigit()):
+            raise ValueError("unsel <N> <位置> または unsel <N> all の形で指定してください")
+        phrase = self._phrase(args[0])
+        if args[1] == "all":
+            self.song.clear_selection(phrase.id)
+        else:
+            self.song.remove_selection(phrase.id, int(args[1]) - 1)
+        self._print_selection(phrase)
 
     # ---- チャンネル・ロック・グループ ----
 
@@ -242,12 +291,22 @@ class _App:
             tags.append(f"g{phrase.group_id}")
         if phrase.locked:
             tags.append("ロック")
-        return f"[{self._number(phrase)}] ({' '.join(tags)}) {phrase.text} → {_summary(phrase)}"
+        return f"[{self._number(phrase)}] ({' '.join(tags)}) {_marked_text(phrase)} → {_summary(phrase)}"
 
     def _print_detail(self, phrase: Phrase) -> None:
         print(self._headline(phrase))
+        print(f"  {_selection_line(phrase)}")
+        fixable = _fixable_line(phrase)
+        if fixable:
+            print(f"  {fixable}")
+        if not phrase.combinations:
+            print("  （候補なし。conv で変換してください）")
         for ci, combination in enumerate(phrase.combinations):
-            _print_combination(ci, combination, ci == phrase.selected)
+            _print_combination(ci, combination)
+
+    def _print_selection(self, phrase: Phrase) -> None:
+        print(self._headline(phrase))
+        print(f"  {_selection_line(phrase)}")
 
 
 def _single(args: list[str]) -> str:
@@ -263,23 +322,35 @@ def _group_id(target: str) -> int:
 
 
 def _summary(phrase: Phrase) -> str:
-    if not phrase.combinations:
-        return "（未変換または変換できません）"
-    return " / ".join(phrase.selected_names())
+    if phrase.selection:
+        return " / ".join(phrase.selected_names())
+    return "（未選択・候補あり）" if phrase.combinations else "（未変換）"
 
 
-def _format_score(score: int) -> str:
-    return " ".join(f"{label}={count}" for label, count in zip(SCORE_LABELS, decode_score(score)) if count)
+def _marked_text(phrase: Phrase) -> str:
+    """「省略しない」にした ー・っ を [ ] で囲んだフレーズ。"""
+    return "".join(f"[{ch}]" if i in phrase.fixed_positions else ch for i, ch in enumerate(phrase.text))
 
 
-def _print_combination(ci: int, combination: Combination, is_selected: bool) -> None:
-    mark = "*" if is_selected else " "
-    print(f" {mark}組合わせ{ci + 1}: {combination.pattern}  ({_format_score(combination.score)})")
+def _fixable_line(phrase: Phrase) -> str:
+    """ー・っ の位置と「省略しない」設定の一覧。ー・っ が無ければ空文字。"""
+    positions = [i for i, ch in enumerate(phrase.text) if is_fixable(ch)]
+    if not positions:
+        return ""
+    line = "省略できる文字: " + " ".join(f"{i + 1}:{phrase.text[i]}" for i in positions)
+    if phrase.fixed_positions:
+        line += "（省略しない: " + " ".join(str(i + 1) for i in sorted(phrase.fixed_positions)) + "）"
+    return line
+
+
+def _selection_line(phrase: Phrase) -> str:
+    if not phrase.selection:
+        return "選択: （なし）"
+    return "選択: " + "  ".join(f"{i}.{name}" for i, name in enumerate(phrase.selected_names(), 1))
+
+
+def _print_combination(ci: int, combination: Combination) -> None:
+    print(f"  組合わせ{ci + 1}: {combination.pattern}  一致度 {combination.similarity:.0%}")
     for si, slot in enumerate(combination.slots):
-        options = []
-        if slot.manual is not None:
-            options.append(f"*手入力.{slot.manual.name}")
-        for ki, candidate in enumerate(slot.candidates):
-            selected = "*" if slot.manual is None and ki == slot.selected else " "
-            options.append(f"{selected}{ki + 1}.{candidate.pokemon.name}")
+        options = [f"{ki + 1}.{c.pokemon.name}({c.similarity:.0%})" for ki, c in enumerate(slot.candidates)]
         print(f"     枠{si + 1} {slot.text}: {'  '.join(options)}")

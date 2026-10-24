@@ -12,7 +12,7 @@ from .repository import Pokemon, make_pokemon
 from .segmenter import Candidate, Combination, Slot
 from .song import DEFAULT_CHANNEL, Group, Phrase, Song
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 def save_song(song: Song, path: Path) -> None:
@@ -39,7 +39,9 @@ def song_to_dict(song: Song) -> dict:
 def song_from_dict(data: dict) -> Song:
     version = data.get("version")
     if version == 1:
-        data = _upgrade_v1(data)
+        data = _upgrade_v2(_upgrade_v1(data))
+    elif version == 2:
+        data = _upgrade_v2(data)
     elif version != FORMAT_VERSION:
         raise ValueError(f"対応していない形式です（version={version}）")
     return Song(
@@ -60,12 +62,30 @@ def _upgrade_v1(data: dict) -> dict:
     ]
     return {
         **data,
-        "version": FORMAT_VERSION,
+        "version": 2,
         "phrases": phrases,
         "groups": [],
         "next_phrase_id": len(phrases) + 1,
         "next_group_id": 1,
     }
+
+
+def _upgrade_v2(data: dict) -> dict:
+    """version 2 を version 3 の形にする。
+
+    選択中の組合わせ候補の各枠で選んでいたポケモン（手入力を含む）を選択情報として引き継ぐ。
+    候補は一致度の付け方が変わって比べられないため捨てる（変換し直して出し直す）。
+    """
+    phrases = []
+    for p in data["phrases"]:
+        selection = []
+        if p["combinations"]:
+            for slot in p["combinations"][p["selected"]]["slots"]:
+                chosen = slot.get("manual") or slot["candidates"][slot["selected"]]
+                selection.append({k: chosen[k] for k in ("id", "name", "reading")})
+        phrase = {k: v for k, v in p.items() if k not in ("selected", "combinations")}
+        phrases.append({**phrase, "combinations": [], "selection": selection})
+    return {**data, "version": FORMAT_VERSION, "phrases": phrases}
 
 
 def _pokemon_to_dict(pokemon: Pokemon) -> dict:
@@ -83,18 +103,21 @@ def _phrase_to_dict(phrase: Phrase) -> dict:
         "channel": phrase.channel,
         "locked": phrase.locked,
         "group_id": phrase.group_id,
-        "selected": phrase.selected,
+        "selection": [_pokemon_to_dict(p) for p in phrase.selection],
+        "fixed_positions": sorted(phrase.fixed_positions),
         "combinations": [
             {
                 "score": c.score,
+                "similarity": c.similarity,
                 "slots": [
                     {
                         "start": s.start,
                         "end": s.end,
                         "text": s.text,
-                        "selected": s.selected,
-                        "manual": _pokemon_to_dict(s.manual) if s.manual is not None else None,
-                        "candidates": [{**_pokemon_to_dict(cand.pokemon), "score": cand.score} for cand in s.candidates],
+                        "candidates": [
+                            {**_pokemon_to_dict(cand.pokemon), "score": cand.score, "similarity": cand.similarity}
+                            for cand in s.candidates
+                        ],
                     }
                     for s in c.slots
                 ],
@@ -112,13 +135,14 @@ def _phrase_from_dict(data: dict) -> Phrase:
                     start=s["start"],
                     end=s["end"],
                     text=s["text"],
-                    selected=s["selected"],
-                    manual=_pokemon_from_dict(s["manual"]) if s.get("manual") else None,
-                    candidates=[Candidate(_pokemon_from_dict(cand), cand["score"]) for cand in s["candidates"]],
+                    candidates=[
+                        Candidate(_pokemon_from_dict(cand), cand["score"], cand["similarity"]) for cand in s["candidates"]
+                    ],
                 )
                 for s in c["slots"]
             ],
             score=c["score"],
+            similarity=c["similarity"],
         )
         for c in data["combinations"]
     ]
@@ -129,5 +153,7 @@ def _phrase_from_dict(data: dict) -> Phrase:
         locked=data["locked"],
         group_id=data["group_id"],
         combinations=combinations,
-        selected=data["selected"],
+        selection=[_pokemon_from_dict(p) for p in data["selection"]],
+        # 「省略しない」設定は後から追加した項目なので、無いファイルは空として読む
+        fixed_positions=set(data.get("fixed_positions", [])),
     )
